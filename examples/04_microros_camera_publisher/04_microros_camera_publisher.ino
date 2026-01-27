@@ -20,8 +20,6 @@ static const uint8_t kLedPins[] = {LED0, LED1, LED2, LED3};
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if ((temp_rc != RCL_RET_OK)) { } }
 
 static rcl_publisher_t publisher;
-static rcl_timer_t timer;
-static rclc_executor_t executor;
 static rclc_support_t support;
 static rcl_allocator_t allocator;
 static rcl_node_t node;
@@ -31,9 +29,7 @@ static sensor_msgs__msg__CompressedImage msg;
 // VGA + JPEG quality 50 is typically well under 160KB; increase if "Image too large" appears.
 static uint8_t g_jpeg_buffer[160 * 1024];
 static const char* kTopicName = "spresense/camera/compressed";
-static const uint32_t kMinIntervalMs = 50;
-static volatile bool g_capture_requested = false;
-static volatile bool g_capture_busy = false;
+static const uint32_t kMinIntervalMs = 10;
 static uint32_t g_last_capture_ms = 0;
 
 enum LedMode {
@@ -101,14 +97,9 @@ static void error_loop() {
 }
 
 static void updateHeaderStamp(std_msgs__msg__Header* header) {
-  const int64_t epoch_ns = rmw_uros_epoch_nanos();
-  if (epoch_ns > 0) {
-    header->stamp.sec = (int32_t)(epoch_ns / 1000000000LL);
-    header->stamp.nanosec = (uint32_t)(epoch_ns % 1000000000LL);
-  } else {
-    header->stamp.sec = 0;
-    header->stamp.nanosec = 0;
-  }
+  const uint32_t now_ms = millis();
+  header->stamp.sec = (int32_t)(now_ms / 1000);
+  header->stamp.nanosec = (uint32_t)((now_ms % 1000) * 1000000UL);
 }
 
 static bool captureJpegToBuffer(uint32_t* out_size) {
@@ -135,18 +126,6 @@ static bool captureJpegToBuffer(uint32_t* out_size) {
   return true;
 }
 
-static void timer_callback(rcl_timer_t* timer, int64_t last_call_time) {
-  (void)last_call_time;
-  if (timer == NULL) {
-    return;
-  }
-
-  if (g_capture_busy || g_capture_requested) {
-    return;
-  }
-  g_capture_requested = true;
-}
-
 void setup() {
   Serial.begin(115200);
   while (!Serial) {
@@ -161,11 +140,6 @@ void setup() {
   setLedMode(LED_WAIT_AGENT);
 
   set_microros_transports();
-
-  while (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
-    updateLed();
-    delay(100);
-  }
 
   delay(2000);
 
@@ -187,8 +161,8 @@ void setup() {
 
   setErrorStage(2);
   err = theCamera.setStillPictureImageFormat(
-      CAM_IMGSIZE_VGA_H,
-      CAM_IMGSIZE_VGA_V,
+      CAM_IMGSIZE_QQVGA_H,
+      CAM_IMGSIZE_QQVGA_V,
       CAM_IMAGE_PIX_FMT_JPG);
   if (err != CAM_ERR_SUCCESS) {
     Serial.print("setStillPictureImageFormat failed: ");
@@ -207,22 +181,18 @@ void setup() {
       ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, CompressedImage),
       kTopicName));
 
-  const unsigned int timer_timeout = 50;
-  RCCHECK(rclc_timer_init_default(
-      &timer,
-      &support,
-      RCL_MS_TO_NS(timer_timeout),
-      timer_callback));
-
-  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
-  RCCHECK(rclc_executor_add_timer(&executor, &timer));
-
   sensor_msgs__msg__CompressedImage__init(&msg);
   msg.data.data = g_jpeg_buffer;
   msg.data.capacity = sizeof(g_jpeg_buffer);
   msg.data.size = 0;
-  rosidl_runtime_c__String__assign(&msg.format, "jpeg");
-  rosidl_runtime_c__String__assign(&msg.header.frame_id, "spresense_camera");
+  static char kFormat[] = "jpeg";
+  static char kFrameId[] = "spresense_camera";
+  msg.format.data = kFormat;
+  msg.format.size = strlen(kFormat);
+  msg.format.capacity = sizeof(kFormat);
+  msg.header.frame_id.data = kFrameId;
+  msg.header.frame_id.size = strlen(kFrameId);
+  msg.header.frame_id.capacity = sizeof(kFrameId);
 
   setLedMode(LED_READY);
   Serial.println("micro-ROS camera publisher ready");
@@ -230,28 +200,23 @@ void setup() {
 
 void loop() {
   updateLed();
-  RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10)));
+  const uint32_t now = millis();
+  if (now - g_last_capture_ms < kMinIntervalMs) {
+    delay(5);
+    return;
+  }
 
-  if (g_capture_requested && !g_capture_busy) {
-    const uint32_t now = millis();
-    if (now - g_last_capture_ms < kMinIntervalMs) {
-      g_capture_requested = false;
-      return;
+  uint32_t jpeg_size = 0;
+  if (captureJpegToBuffer(&jpeg_size)) {
+    updateHeaderStamp(&msg.header);
+    msg.data.data = g_jpeg_buffer;
+    msg.data.size = jpeg_size;
+    rcl_ret_t pub_rc = rcl_publish(&publisher, &msg, NULL);
+    if (pub_rc != RCL_RET_OK) {
+      Serial.print("rcl_publish failed: ");
+      Serial.println((int)pub_rc);
     }
-
-    g_capture_requested = false;
-    g_capture_busy = true;
-
-    uint32_t jpeg_size = 0;
-    if (captureJpegToBuffer(&jpeg_size)) {
-      updateHeaderStamp(&msg.header);
-      msg.data.data = g_jpeg_buffer;
-      msg.data.size = jpeg_size;
-      RCSOFTCHECK(rcl_publish(&publisher, &msg, NULL));
-      g_last_capture_ms = millis();
-    }
-
-    g_capture_busy = false;
+    g_last_capture_ms = millis();
   }
 
   delay(5);
