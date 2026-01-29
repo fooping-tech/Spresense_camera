@@ -27,28 +27,35 @@ static rcl_node_t node;
 
 static sensor_msgs__msg__Image msg;
 
-static uint8_t g_image_buffer[1024];
+static const char* kTopicName = "spresense/camera/stream/image";
+static const uint32_t kMinIntervalMs = 200;
+// MTU and history limits depend on transport; keep below the verified limit.
+static const uint32_t kMaxPayloadBytes = 10000;
+// Keep payload well under 2 KB for serial transport (mono8 => 1 byte per pixel).
+static const uint32_t kOutWidth = 48;
+static const uint32_t kOutHeight = 36;
+static const uint32_t kImageBufferBytes = kOutWidth * kOutHeight;
+static uint8_t g_image_buffer[kImageBufferBytes];
+
 static volatile uint8_t g_error_stage = 0;
 static volatile int g_last_cam_err = 0;
 static volatile rcl_ret_t g_last_rcl_err = RCL_RET_OK;
 static volatile bool g_buffer_locked = false;
 static volatile bool g_frame_ready = false;
+static volatile bool g_payload_too_large = false;
 static volatile uint32_t g_frame_size = 0;
 static volatile uint32_t g_frame_count = 0;
 static volatile uint32_t g_cb_count = 0;
 static volatile uint32_t g_format_fail = 0;
 static volatile uint32_t g_scale_fail = 0;
-static volatile uint32_t g_size_over = 0;
+static volatile uint32_t g_buffer_over = 0;
+static volatile uint32_t g_payload_over = 0;
+static volatile uint32_t g_publish_skip = 0;
+#if DEBUG_SERIAL
 static uint32_t g_last_debug_ms = 0;
 static uint32_t g_last_debug_count = 0;
+#endif
 static uint32_t g_last_publish_ms = 0;
-
-static const char* kTopicName = "spresense/camera/stream/image";
-static const uint32_t kMinIntervalMs = 200;
-// micro-ROS custom transport MTU(512)*history(4)=2048 bytes; keep payload below this.
-static const uint32_t kMaxPayloadBytes = 600;
-static const uint32_t kOutWidth = 20;
-static const uint32_t kOutHeight = 15;
 
 static void setAllLeds(bool on) {
   const uint8_t val = on ? HIGH : LOW;
@@ -135,13 +142,13 @@ static void CamCB(CamImage img) {
 
   const uint32_t size = kOutWidth * kOutHeight;
   if (size > sizeof(g_image_buffer)) {
-    g_size_over++;
+    g_buffer_over++;
     return;
   }
-  if (size > kMaxPayloadBytes) {
-    digitalWrite(LED2, !digitalRead(LED2));
-    g_size_over++;
-    return;
+
+  const bool payload_too_large = (size > kMaxPayloadBytes);
+  if (payload_too_large) {
+    g_payload_over++;
   }
 
   g_buffer_locked = true;
@@ -156,7 +163,9 @@ static void CamCB(CamImage img) {
       g_image_buffer[y * kOutWidth + x] = yval;
     }
   }
+
   g_frame_size = size;
+  g_payload_too_large = payload_too_large;
   g_frame_ready = true;
   g_frame_count++;
   // Frame accepted indicator.
@@ -171,7 +180,7 @@ void setup() {
   while (!Serial && (millis() - start_ms < 2000)) {
     ;
   }
-  Serial.println("streaming debug start");
+  Serial.println("streaming fixed size start");
   #endif
 
   for (size_t i = 0; i < 4; ++i) {
@@ -203,7 +212,7 @@ void setup() {
   setErrorStage(3);
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
   setErrorStage(4);
-  RCCHECK(rclc_node_init_default(&node, "spresense_camera_stream_node", "", &support));
+  RCCHECK(rclc_node_init_default(&node, "spresense_camera_stream_fixed_node", "", &support));
   setErrorStage(5);
   RCCHECK(rclc_publisher_init_best_effort(
       &publisher,
@@ -250,8 +259,12 @@ void loop() {
     Serial.print(g_format_fail);
     Serial.print(" scale_fail=");
     Serial.print(g_scale_fail);
-    Serial.print(" size_over=");
-    Serial.println(g_size_over);
+    Serial.print(" buffer_over=");
+    Serial.print(g_buffer_over);
+    Serial.print(" payload_over=");
+    Serial.print(g_payload_over);
+    Serial.print(" publish_skip=");
+    Serial.println(g_publish_skip);
     g_last_debug_count = count;
     g_last_debug_ms = now_ms;
   }
@@ -274,6 +287,13 @@ void loop() {
   }
 
   g_buffer_locked = true;
+  if (g_payload_too_large) {
+    g_publish_skip++;
+    g_frame_ready = false;
+    g_buffer_locked = false;
+    delay(2);
+    return;
+  }
   updateHeaderStamp(&msg.header);
   msg.data.data = g_image_buffer;
   msg.data.size = g_frame_size;
