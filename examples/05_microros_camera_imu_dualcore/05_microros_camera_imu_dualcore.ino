@@ -30,6 +30,8 @@ static rcl_publisher_t image_publisher;
 static rcl_publisher_t imu_publisher;
 static sensor_msgs__msg__CompressedImage msg_static;
 static sensor_msgs__msg__Imu imu_msg;
+static bool g_microros_ready = false;
+static uint32_t g_last_agent_ping_ms = 0;
 
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){error_loop();}}
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ printf("soft error\n");}}
@@ -44,6 +46,83 @@ void error_loop(){
     digitalWrite(LED0, !digitalRead(LED0));
     delay(100);
   }
+}
+
+static void waitForAgent() {
+  while (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
+    digitalWrite(LED0, !digitalRead(LED0));
+    delay(100);
+  }
+  digitalWrite(LED0, LOW);
+}
+
+static void cleanupMicroRos() {
+  if (!g_microros_ready) {
+    return;
+  }
+  rcl_publisher_fini(&imu_publisher, &node);
+  rcl_publisher_fini(&image_publisher, &node);
+  rcl_node_fini(&node);
+  rclc_support_fini(&support);
+  g_microros_ready = false;
+}
+
+static bool initMicroRos() {
+  allocator = rcl_get_default_allocator();
+
+  if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) {
+    return false;
+  }
+
+  if (rclc_node_init_default(&node, "my_node_serial", "", &support) != RCL_RET_OK) {
+    rclc_support_fini(&support);
+    return false;
+  }
+
+  if (rclc_publisher_init_default(
+        &image_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, CompressedImage),
+        "image/compressed") != RCL_RET_OK) {
+    rcl_node_fini(&node);
+    rclc_support_fini(&support);
+    return false;
+  }
+
+  if (rclc_publisher_init_default(
+        &imu_publisher,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
+        "imu_spresense") != RCL_RET_OK) {
+    rcl_publisher_fini(&image_publisher, &node);
+    rcl_node_fini(&node);
+    rclc_support_fini(&support);
+    return false;
+  }
+
+  g_microros_ready = true;
+  return true;
+}
+
+static bool ensureMicroRosConnected() {
+  const uint32_t now_ms = millis();
+  if (now_ms - g_last_agent_ping_ms < 1000) {
+    return g_microros_ready;
+  }
+  g_last_agent_ping_ms = now_ms;
+
+  if (rmw_uros_ping_agent(50, 1) == RMW_RET_OK) {
+    g_microros_ready = true;
+    return true;
+  }
+
+  cleanupMicroRos();
+  waitForAgent();
+  while (!initMicroRos()) {
+    delay(500);
+    waitForAgent();
+  }
+  return g_microros_ready;
 }
 
 void IMU_print_rslt(int8_t rslt) {
@@ -88,26 +167,12 @@ void setup() {
   set_microros_transports();
 
   delay(2000);
-  
-  allocator = rcl_get_default_allocator();
 
-  //create init_options
-  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));   
-  
-  // create node 
-  RCCHECK(rclc_node_init_default(&node, "my_node_serial", "", &support));
-  
-  // create publishers
-  RCCHECK(rclc_publisher_init_default(
-    &image_publisher,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, CompressedImage),
-    "image/compressed"));
-  RCCHECK(rclc_publisher_init_default(
-    &imu_publisher,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
-    "imu_spresense"));
+  waitForAgent();
+  while (!initMicroRos()) {
+    delay(500);
+    waitForAgent();
+  }
 
 
   static uint8_t img_buff[20000] = {0};
@@ -157,6 +222,8 @@ void setup() {
 
 
 void loop() {
+  ensureMicroRosConnected();
+
   digitalWrite(LED2, LOW);
   digitalWrite(LED3, LOW);
   CamImage img = theCamera.takePicture();
